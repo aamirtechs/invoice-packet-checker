@@ -1,4 +1,5 @@
 # invoice-packet-checker
+**Live tool:** https://aamirtechs.github.io/invoice-packet-checker/ (runs in your browser, no install)
 
 Check an invoice packet folder before a factoring submission, so a
 missing document is caught by a script instead of a rejection email.

@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>invoice-packet-checker</title>
+<style>
+*{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f6f8fb;color:#17233b}
+header{background:#0b1f3a;color:#fff;padding:28px 20px;border-bottom:4px solid #d4a72c}
+header .wrap, main{max-width:900px;margin:0 auto}
+header h1{margin:0 0 6px;font-size:28px} header p{margin:0;color:#cfd9e8}
+main{padding:22px 16px 40px}
+.card{background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(11,31,58,.08)}
+label{font-weight:600;display:block;margin:14px 0 6px}
+textarea{width:100%;min-height:170px;padding:10px;border:1px solid #c9d3e0;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+input[type=text],input[type=number],input[type=date],select{padding:8px 10px;border:1px solid #c9d3e0;border-radius:8px;max-width:100%}
+.row{display:flex;flex-wrap:wrap;gap:14px} .row>div{flex:1 1 180px}
+button{background:#0b1f3a;color:#fff;border:0;border-radius:8px;padding:10px 18px;cursor:pointer;font-size:15px}
+button.accent{background:#d4a72c;color:#17233b;font-weight:700}
+button.secondary{background:#e7edf5;color:#0b1f3a}
+.btns{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+pre{background:#0b1f3a;color:#eef3fa;border-radius:10px;padding:16px;overflow:auto;white-space:pre-wrap;min-height:120px;font-size:13px}
+footer{max-width:900px;margin:0 auto;padding:0 16px 30px;color:#5a6a82;font-size:14px}
+a{color:#0b1f3a}
+.note{color:#5a6a82;font-size:13px}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>invoice-packet-checker</h1><p>Check an invoice packet before a factoring submission: which required documents are missing, which classified files are empty, and whether load numbers disagree.</p></div></header>
+<main>
+<div class="card">
+<label for="file">Choose a file</label>
+<input type="file" id="file" multiple>
+<label for="input">Packet files (one block per file)</label>
+<textarea id="input" placeholder="Paste input here, choose a file, or load the sample."></textarea>
+<p class="note">Format: each file starts with a line @file NAME, followed by its text content, until the next @file line. A file with no content lines counts as an empty file. Choosing files above fills this in for you. Non-text files (for example PDFs) can be listed with an @file line and no content: they still count for the missing-document check, like in the CLI.</p>
+<div class="row">
+<div><label for="folder">Folder label shown in the report</label><input type="text" id="folder" value="packet"></div>
+<div><label for="required">Required categories (CLI --required)</label><input type="text" id="required" value="bol,pod,ratecon,invoice"></div>
+</div>
+<div class="btns">
+<button class="accent" id="run">Run</button>
+<button class="secondary" id="sample">Load sample</button>
+<button class="secondary" id="sample2">Load missing-POD sample</button>
+<button class="secondary" id="download">Download report</button>
+</div>
+<label for="output">Report</label>
+<pre id="output">Press Run to see the report.</pre>
+</div>
+</main>
+<footer>
+<p>Built by AamirTechs. <a href="https://aamirtechs.github.io/">All tools</a> | <a href="https://github.com/aamirtechs/invoice-packet-checker">Source</a></p>
+<p>Privacy: this tool runs 100% in your browser, nothing is uploaded.</p>
+</footer>
+<script id="core">
+
+var CATEGORIES=["bol","pod","ratecon","invoice"];
+var TEXT_EXTS=[".txt",".md",".csv",".json"];
+function parseFiles(text){
+  var files=[], current=null;
+  String(text==null?"":text).split(/\r?\n/).forEach(function(line){
+    if(line.indexOf("@file ")===0){ current={name:line.slice(6).trim(), lines:[]}; files.push(current); }
+    else if(current) current.lines.push(line);
+  });
+  files.forEach(function(f){ f.content = f.lines.length ? f.lines.join("\n")+"\n" : ""; delete f.lines; });
+  return files;
+}
+function baseName(p){ var i=p.lastIndexOf("/"); return i>=0?p.slice(i+1):p; }
+function extOf(name){ var b=baseName(name); var i=b.lastIndexOf("."); if(i<=0) return ""; return b.slice(i).toLowerCase(); }
+function stemOf(name){ var b=baseName(name).toLowerCase(); var i=b.lastIndexOf("."); if(i>0) b=b.slice(0,i); return b; }
+function classify(name){
+  var tokens=new Set(stemOf(name).split(/[^a-z0-9]+/).filter(function(t){return t!=="";}));
+  if(tokens.has("bol")||(tokens.has("bill")&&tokens.has("lading"))) return "bol";
+  if(tokens.has("pod")||(tokens.has("proof")&&tokens.has("delivery"))||(tokens.has("delivery")&&tokens.has("receipt"))) return "pod";
+  if(tokens.has("ratecon")||(tokens.has("rate")&&(tokens.has("confirmation")||tokens.has("conf")))) return "ratecon";
+  if(tokens.has("invoice")||tokens.has("inv")) return "invoice";
+  return null;
+}
+function loadNumbers(content){
+  var re=/load\s*(?:no\.?|number|#)?\s*:?\s*([A-Za-z0-9][A-Za-z0-9\-]{2,19})/gi;
+  var found=[], m;
+  while((m=re.exec(content))!==null){ var v=m[1].replace(/^-+|-+$/g,""); if(v && found.indexOf(v)<0) found.push(v); }
+  return found;
+}
+window.runTool = function(inputText, options){
+  options=options||{};
+  var folder=options.folderName||"packet";
+  var requiredText = options.required || "bol,pod,ratecon,invoice";
+  var required=requiredText.split(",").map(function(s){return s.trim();}).filter(function(s){return s!=="";});
+  var unknown=required.filter(function(r){ return CATEGORIES.indexOf(r)<0; });
+  if(unknown.length) return "error: unknown categories: "+unknown.join(", ");
+  var files=parseFiles(inputText);
+  files.sort(function(a,b){ return a.name<b.name?-1:(a.name>b.name?1:0); });
+  var byCat={bol:[],pod:[],ratecon:[],invoice:[]}, unclassified=[], loadByFile={}, problems=[], warnings=[];
+  files.forEach(function(f){
+    var cat=classify(f.name);
+    if(cat===null){ unclassified.push(f.name); return; }
+    byCat[cat].push(f.name);
+    if(f.content.length===0) problems.push(cat+" file is empty: "+f.name);
+    if(TEXT_EXTS.indexOf(extOf(f.name))>=0){ var nums=loadNumbers(f.content); if(nums.length) loadByFile[f.name]=nums; }
+  });
+  required.forEach(function(cat){ if(!byCat[cat].length) problems.push("missing document: "+cat); });
+  var allNums=new Set(); Object.keys(loadByFile).forEach(function(k){ loadByFile[k].forEach(function(n){ allNums.add(n); }); });
+  if(allNums.size>1){
+    var detail=Object.keys(loadByFile).sort().map(function(k){ return k+": "+loadByFile[k].join(", "); }).join("; ");
+    problems.push("load number mismatch across documents: "+detail);
+  }
+  if(byCat.invoice.length>1) warnings.push("multiple invoices found ("+byCat.invoice.length+"); confirm only one is current");
+  unclassified.forEach(function(n){ warnings.push("unclassified file (ignored): "+n); });
+  var lines=["Invoice packet check","=====================","Folder: "+folder,""];
+  CATEGORIES.forEach(function(cat){ lines.push(byCat[cat].length ? cat+": "+byCat[cat].join(", ") : cat+": MISSING"); });
+  lines.push("");
+  var loadNames=Object.keys(loadByFile).sort();
+  if(loadNames.length){
+    lines.push("Load numbers found:");
+    loadNames.forEach(function(k){ lines.push("  "+k+": "+loadByFile[k].join(", ")); });
+    lines.push("");
+  }
+  if(problems.length){ lines.push("Problems:"); problems.forEach(function(p){ lines.push("  "+p); }); }
+  else lines.push("Problems: none. Packet is ready.");
+  lines.push("");
+  if(warnings.length){ lines.push("Warnings:"); warnings.forEach(function(w){ lines.push("  "+w); }); }
+  else lines.push("Warnings: none");
+  return lines.join("\n")+"\n";
+};
+
+</script>
+<script>
+var SAMPLE = `@file BOL-48210.txt
+Load 48210
+Bill of lading for load 48210.
+@file Invoice-48210.txt
+Load 48210
+Invoice total: 2400 USD.
+@file POD-48210.txt
+Load 48210
+Proof of delivery, signed.
+@file RateCon-48210.txt
+Load 48210
+Rate: 2400 USD.
+`;
+var SAMPLE_NAME = "complete";
+var pickedName = "";
+var inputEl = document.getElementById("input");
+var outputEl = document.getElementById("output");
+document.getElementById("file").addEventListener("change", function(ev){
+
+  var files = Array.prototype.slice.call(ev.target.files); if(!files.length) return;
+  files.sort(function(a,b){ return a.name < b.name ? -1 : 1; });
+  var done = 0; var blocks = new Array(files.length);
+  files.forEach(function(f, i){
+    var r = new FileReader();
+    r.onload = function(){
+      var text = String(r.result || "");
+      if (text.endsWith("\n")) text = text.slice(0, -1);
+      blocks[i] = "@file " + f.name + (text ? "\n" + text : "");
+      done++; if(done === files.length){ inputEl.value = blocks.join("\n") + "\n"; }
+    };
+    r.onerror = function(){ blocks[i] = "@file " + f.name; done++; if(done === files.length){ inputEl.value = blocks.join("\n") + "\n"; } };
+    r.readAsText(f);
+  });
+});
+function gatherOptions(){ return { folderName: document.getElementById("folder").value || "packet", required: document.getElementById("required").value || "bol,pod,ratecon,invoice" }; }
+document.getElementById("run").addEventListener("click", function(){
+  try { outputEl.textContent = window.runTool(inputEl.value, gatherOptions()); }
+  catch(e){ outputEl.textContent = "Error: " + e.message; }
+});
+document.getElementById("sample").addEventListener("click", function(){
+  inputEl.value = SAMPLE; pickedName = SAMPLE_NAME;
+  document.getElementById("folder").value = "examples/complete";
+});
+document.getElementById("download").addEventListener("click", function(){
+  var blob = new Blob([outputEl.textContent], {type:"text/plain"});
+  var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "report.txt"; a.click(); URL.revokeObjectURL(a.href);
+});
+document.getElementById("sample2").addEventListener("click", function(){ inputEl.value = SAMPLE2; pickedName = "missing-pod"; document.getElementById("folder").value = "examples/missing-pod"; });
+var SAMPLE2 = `@file BOL-48210.txt
+Load 48210
+Bill of lading.
+@file Invoice-48210.txt
+Load 48210
+Invoice total: 2400 USD.
+@file RateCon-48210.txt
+Load 48210
+Rate: 2400 USD.
+`;
+</script>
+</body>
+</html>
