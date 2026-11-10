@@ -18,6 +18,12 @@ named ``BOL-48210.pdf`` counts as the BOL. Load-number consistency
 needs readable text, so it only runs over .txt, .md, .csv, and .json
 files; a packet of PDFs still gets the missing-document check.
 
+The total check reads dollar amounts from the invoice and ratecon
+text, written as ``$2,400.00`` or ``2400 USD``. The largest amount
+in each category is taken as the total, and a disagreement is
+reported as a problem. When either category has no readable
+amounts, the check is skipped.
+
 Usage:
 
     python3 invoice_packet_checker.py examples/complete
@@ -37,6 +43,10 @@ CATEGORIES = ("bol", "pod", "ratecon", "invoice")
 TEXT_EXTENSIONS = (".txt", ".md", ".csv", ".json")
 LOAD_RE = re.compile(
     r"load\s*(?:no\.?|number|#)?\s*:?\s*([A-Za-z0-9][A-Za-z0-9\-]{2,19})",
+    re.IGNORECASE)
+AMOUNT_RE = re.compile(
+    r"\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
+    r"|([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*USD\b",
     re.IGNORECASE)
 
 
@@ -76,6 +86,59 @@ def load_numbers_in(path):
     return found
 
 
+def parse_amount(text):
+    """Parse an amount string like ``2,400.00`` into integer cents.
+
+    One decimal digit reads as tenths, so ``0.5`` is 50 cents.
+    """
+    cleaned = text.replace(",", "")
+    if "." in cleaned:
+        dollars, _, cents = cleaned.partition(".")
+        cents = (cents + "00")[:2]
+    else:
+        dollars, cents = cleaned, "00"
+    return int(dollars) * 100 + int(cents)
+
+
+def amounts_in(path):
+    """Extract dollar amounts (as integer cents) from a readable
+    text file, or [].
+
+    Amounts must be marked with a leading ``$`` or a trailing
+    ``USD``; bare numbers are never taken as amounts.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="strict") as handle:
+            text = handle.read()
+    except (OSError, UnicodeDecodeError):
+        return []
+    found = []
+    for match in AMOUNT_RE.finditer(text):
+        value = parse_amount(match.group(1) or match.group(2))
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def format_cents(cents):
+    """Format an amount in integer cents as ``$1,234.56``."""
+    sign = "-" if cents < 0 else ""
+    return "%s$%s.%02d" % (sign, "{:,}".format(abs(cents) // 100),
+                           abs(cents) % 100)
+
+
+def largest_amount(amounts_by_file, names):
+    """Largest amount across the named files, or None.
+
+    The largest dollar amount in a document is taken as its
+    total, so line items plus a grand total still compare by the
+    total.
+    """
+    totals = [max(amounts_by_file[name]) for name in names
+              if name in amounts_by_file]
+    return max(totals) if totals else None
+
+
 def check_packet(folder, required):
     files = []
     for root, _dirs, names in os.walk(folder):
@@ -85,6 +148,7 @@ def check_packet(folder, required):
     by_category = {category: [] for category in CATEGORIES}
     unclassified = []
     load_by_file = {}
+    amounts_by_file = {}
     problems = []
     warnings = []
 
@@ -103,6 +167,10 @@ def check_packet(folder, required):
             numbers = load_numbers_in(path)
             if numbers:
                 load_by_file[os.path.relpath(path, folder)] = numbers
+            if category in ("invoice", "ratecon"):
+                amounts = amounts_in(path)
+                if amounts:
+                    amounts_by_file[os.path.relpath(path, folder)] = amounts
 
     for category in required:
         if not by_category.get(category):
@@ -118,6 +186,16 @@ def check_packet(folder, required):
         problems.append(
             "load number mismatch across documents: %s" % detail)
 
+    invoice_total = largest_amount(amounts_by_file,
+                                   by_category["invoice"])
+    ratecon_total = largest_amount(amounts_by_file,
+                                   by_category["ratecon"])
+    if (invoice_total is not None and ratecon_total is not None
+            and invoice_total != ratecon_total):
+        problems.append(
+            "amount mismatch: invoice total %s vs ratecon total %s"
+            % (format_cents(invoice_total), format_cents(ratecon_total)))
+
     if len(by_category["invoice"]) > 1:
         warnings.append(
             "multiple invoices found (%d); confirm only one is current"
@@ -131,6 +209,8 @@ def check_packet(folder, required):
         "unclassified": unclassified,
         "load_numbers": {name: numbers
                          for name, numbers in sorted(load_by_file.items())},
+        "amounts": {name: amounts
+                    for name, amounts in sorted(amounts_by_file.items())},
         "problems": problems,
         "warnings": warnings,
         "ready": not problems,
@@ -152,6 +232,12 @@ def render_text(result):
         lines.append("Load numbers found:")
         for name, numbers in result["load_numbers"].items():
             lines.append("  %s: %s" % (name, ", ".join(numbers)))
+        lines.append("")
+    if result["amounts"]:
+        lines.append("Amounts found:")
+        for name, amounts in result["amounts"].items():
+            lines.append("  %s: %s" % (name, ", ".join(
+                format_cents(amount) for amount in amounts)))
         lines.append("")
     if result["problems"]:
         lines.append("Problems:")

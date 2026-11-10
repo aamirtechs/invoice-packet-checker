@@ -127,6 +127,95 @@ class TestCheck(unittest.TestCase):
         self.assertTrue(result["ready"])
 
 
+class TestAmounts(unittest.TestCase):
+    def test_parse_amount(self):
+        self.assertEqual(ipc.parse_amount("2,400.00"), 240000)
+        self.assertEqual(ipc.parse_amount("2400"), 240000)
+        self.assertEqual(ipc.parse_amount("0.5"), 50)
+
+    def test_amounts_in_dollar_and_usd_formats(self):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8")
+        handle.write("Total: $2,400.00\nDeposit: $200.50\n"
+                     "Rate: 2400 USD\n")
+        handle.close()
+        try:
+            self.assertEqual(
+                ipc.amounts_in(handle.name), [240000, 20050])
+        finally:
+            os.unlink(handle.name)
+
+    def test_bare_numbers_are_not_amounts(self):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8")
+        handle.write("Load 48210\nInvoice total 2400\n")
+        handle.close()
+        try:
+            self.assertEqual(ipc.amounts_in(handle.name), [])
+        finally:
+            os.unlink(handle.name)
+
+    def test_amount_mismatch_is_a_problem(self):
+        folder = packet({
+            "BOL-1.txt": "Load 48210\n",
+            "POD-1.txt": "Load 48210\n",
+            "RateCon-1.txt": "Load 48210\nRate: 2400 USD\n",
+            "Invoice-1.txt": "Load 48210\nInvoice total: $2,300.00\n",
+        })
+        result = ipc.check_packet(folder, list(ipc.CATEGORIES))
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("amount mismatch" in p
+                            for p in result["problems"]))
+        self.assertEqual(result["amounts"]["Invoice-1.txt"], [230000])
+        self.assertEqual(result["amounts"]["RateCon-1.txt"], [240000])
+
+    def test_matching_totals_are_ready(self):
+        folder = packet({
+            "BOL-1.txt": "Load 48210\n",
+            "POD-1.txt": "Load 48210\n",
+            "RateCon-1.txt": "Load 48210\nRate: 2400 USD\n",
+            "Invoice-1.txt": "Load 48210\nInvoice total: $2,400.00\n",
+        })
+        result = ipc.check_packet(folder, list(ipc.CATEGORIES))
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["problems"], [])
+
+    def test_total_is_the_largest_amount(self):
+        folder = packet({
+            "BOL-1.txt": "Load 48210\n",
+            "POD-1.txt": "Load 48210\n",
+            "RateCon-1.txt": "Load 48210\nRate: 2400 USD\n",
+            "Invoice-1.txt": "Linehaul: $2,000.00\n"
+                             "Fuel surcharge: $400.00\n"
+                             "Invoice total: $2,400.00\n",
+        })
+        result = ipc.check_packet(folder, list(ipc.CATEGORIES))
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["amounts"]["Invoice-1.txt"],
+                         [200000, 40000, 240000])
+
+    def test_no_amounts_skips_the_check(self):
+        folder = packet({
+            "BOL-1.txt": "Load 48210\n",
+            "POD-1.txt": "Load 48210\n",
+            "RateCon-1.txt": "Load 48210\n",
+            "Invoice-1.txt": "Load 48210\n",
+        })
+        result = ipc.check_packet(folder, list(ipc.CATEGORIES))
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["amounts"], {})
+
+    def test_one_sided_amounts_skip_the_check(self):
+        folder = packet({
+            "BOL-1.txt": "Load 48210\n",
+            "POD-1.txt": "Load 48210\n",
+            "RateCon-1.txt": "Load 48210\n",
+            "Invoice-1.txt": "Load 48210\nInvoice total: $2,400.00\n",
+        })
+        result = ipc.check_packet(folder, list(ipc.CATEGORIES))
+        self.assertTrue(result["ready"])
+
+
 class TestCli(unittest.TestCase):
     def run_cli(self, args):
         return subprocess.run(
@@ -160,6 +249,22 @@ class TestCli(unittest.TestCase):
             [os.path.join(ROOT, "examples", "complete"),
              "--required", "bol,banana"])
         self.assertEqual(proc.returncode, 2)
+
+    def test_amount_mismatch_exits_one(self):
+        folder = packet({
+            "BOL-1.txt": "Load 48210\n",
+            "POD-1.txt": "Load 48210\n",
+            "RateCon-1.txt": "Load 48210\nRate: 2400 USD\n",
+            "Invoice-1.txt": "Load 48210\nInvoice total: $2,300.00\n",
+        })
+        proc = self.run_cli([folder, "--check"])
+        data = json.loads(self.run_cli([folder, "--json"]).stdout)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("amount mismatch", proc.stdout)
+        self.assertIn("$2,400.00", proc.stdout)
+        self.assertIn("$2,300.00", proc.stdout)
+        self.assertEqual(data["amounts"]["Invoice-1.txt"], [230000])
+        self.assertEqual(data["amounts"]["RateCon-1.txt"], [240000])
 
 
 if __name__ == "__main__":
